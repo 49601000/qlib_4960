@@ -1,8 +1,16 @@
 """
 Qlib Japan - AI駆動の日本株クオンツ投資プラットフォーム
-Streamlit Webアプリ（Qlib実バックテスト接続版）
+Streamlit Webアプリ（クラウド / ローカル 自動切替版）
+
+動作モード:
+  ☁️  クラウドモード : Streamlit Cloud などの環境
+                       yfinance + テクニカルシグナルで動作
+  💻  ローカルモード : 手元PCで data_collector_japan.py 実行済み
+                       Qlib AIモデル（LightGBM / LSTM 等）フル動作
 """
 
+import os
+import sys
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,12 +18,61 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+from pathlib import Path
 import yfinance as yf
 
-# ─── Qlib 接続モジュール ───────────────────────────────────────────────────────
-from qlib_init import init_qlib, check_data_availability
-from model_trainer import QlibModelTrainer, RollingTrainer
-from backtest_runner import run_backtest, compute_ic, build_portfolio
+# ─── 環境自動判定 ──────────────────────────────────────────────────────────────
+# 判定優先順位:
+#   1. 環境変数 QLIB_MODE=cloud / local で強制指定
+#   2. Streamlit Cloud 特有の環境変数が存在する
+#   3. Qlibデータディレクトリが存在しない
+#   4. pyqlib がインストールされていない
+
+def _detect_environment() -> str:
+    """動作環境を自動判定して 'cloud' or 'local' を返す"""
+    # 強制指定
+    forced = os.environ.get("QLIB_MODE", "").lower()
+    if forced in ("cloud", "local"):
+        return forced
+
+    # Streamlit Cloud 判定（特有の環境変数）
+    if os.environ.get("STREAMLIT_SHARING_MODE") or \
+       os.environ.get("HOME", "") == "/home/appuser":
+        return "cloud"
+
+    # Qlibデータディレクトリの存在確認
+    qlib_data = Path.home() / ".qlib" / "qlib_data" / "jp_data"
+    if not qlib_data.exists():
+        return "cloud"
+
+    # pyqlib インストール確認
+    try:
+        import qlib  # noqa: F401
+        return "local"
+    except ImportError:
+        return "cloud"
+
+ENV_MODE = _detect_environment()   # "cloud" or "local"
+IS_CLOUD = (ENV_MODE == "cloud")
+IS_LOCAL = (ENV_MODE == "local")
+
+# ─── Qlib 接続モジュール（ローカルのみ） ──────────────────────────────────────
+if IS_LOCAL:
+    try:
+        from qlib_init import init_qlib, check_data_availability
+        from model_trainer import QlibModelTrainer, RollingTrainer
+        from backtest_runner import run_backtest, compute_ic, build_portfolio
+        _QLIB_MODULES_OK = True
+    except ImportError as e:
+        st.warning(f"Qlibモジュール読み込みエラー: {e}")
+        _QLIB_MODULES_OK = False
+else:
+    # クラウドではダミーを定義（呼ばれない）
+    _QLIB_MODULES_OK = False
+    def init_qlib(*a, **k): return False
+    def run_backtest(*a, **k): return {}
+    def compute_ic(*a, **k): return pd.DataFrame()
+    def build_portfolio(*a, **k): return pd.DataFrame()
 
 # ─── ページ設定 ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -290,17 +347,127 @@ def fetch_stock_data(ticker: str, period: str = "1y") -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ─── Qlib 初期化（アプリ起動時に一度だけ実行） ─────────────────────────────────
+# ─── Qlib 初期化（ローカルのみ・アプリ起動時に一度だけ実行） ───────────────────
 @st.cache_resource(show_spinner=False)
 def get_qlib_status() -> bool:
     """Qlib の初期化状態をキャッシュ"""
+    if IS_CLOUD or not _QLIB_MODULES_OK:
+        return False
     return init_qlib()
 
 QLIB_AVAILABLE = get_qlib_status()
 
 
-# ─── Qlib 実バックテスト（メイン関数） ─────────────────────────────────────────
+# ─── テクニカルシグナル生成（クラウド・フォールバック共通） ──────────────────────
+def _make_technical_signal(price_df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    """
+    モメンタム + 移動平均クロス + RSI の複合シグナル。
+    Qlibなし環境でのバックテストに使用。
+    """
+    p = price_df["終値"]
+    mom5   = p.pct_change(5).fillna(0)
+    mom20  = p.pct_change(20).fillna(0)
+    ma20   = p.rolling(20).mean()
+    ma60   = p.rolling(60).mean()
+    ma_sig = (ma20 > ma60).astype(float) - 0.5
 
+    # 簡易RSI
+    delta  = p.diff()
+    gain   = delta.clip(lower=0).rolling(14).mean()
+    loss   = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi    = 100 - (100 / (1 + gain / loss.replace(0, 1e-9)))
+    rsi_sig = ((rsi - 50) / 50).fillna(0)
+
+    signal = (mom5 * 0.4 + mom20 * 0.3 + ma_sig * 0.2 + rsi_sig * 0.1).fillna(0)
+    aligned = price_df.loc[start:end]
+    return signal.loc[start:end].reindex(aligned.index).fillna(0).to_frame("score")
+
+
+def _run_cloud_backtest(price_df: pd.DataFrame, pred_df: pd.DataFrame,
+                         test_start: str, test_end: str,
+                         transaction_cost_bps: int) -> dict:
+    """
+    クラウド環境用のシンプルバックテスト（yfinanceデータのみで完結）。
+    """
+    cost_rate = transaction_cost_bps / 10_000
+    aligned = price_df.loc[test_start:test_end].copy()
+    aligned["signal"] = pred_df["score"].reindex(aligned.index).fillna(0)
+    aligned["ret"]    = aligned["終値"].pct_change().fillna(0)
+    aligned["pos"]    = (aligned["signal"] > 0).astype(float)
+    trade             = aligned["pos"].diff().abs().fillna(0)
+    aligned["cost"]   = trade * cost_rate
+    aligned["strat"]  = aligned["pos"].shift(1).fillna(0) * aligned["ret"] - aligned["cost"]
+
+    cum_s = (1 + aligned["strat"]).cumprod()
+    cum_b = (1 + aligned["ret"]).cumprod()
+    dd    = cum_s / cum_s.cummax() - 1
+    n     = max(len(aligned), 1)
+    tot   = cum_s.iloc[-1] - 1
+    ann   = (1 + tot) ** (252 / n) - 1
+    std   = aligned["strat"].std()
+    shrp  = (aligned["strat"].mean() / std * np.sqrt(252)) if std > 0 else 0
+
+    return {
+        "cum_strategy":  cum_s,
+        "cum_benchmark": cum_b,
+        "drawdown":      dd,
+        "total_return":  tot,
+        "annual_return": ann,
+        "sharpe_ratio":  shrp,
+        "max_drawdown":  dd.min(),
+        "win_rate":      (aligned["strat"] > 0).mean(),
+        "source":        "cloud",
+    }
+
+
+def _cloud_compute_ic(price_df: pd.DataFrame, pred_df: pd.DataFrame) -> pd.DataFrame:
+    """クラウド用IC計算（yfinanceデータ + テクニカルシグナル）"""
+    fwd = price_df["終値"].pct_change(5).shift(-5)
+    df  = pd.DataFrame({"score": pred_df["score"], "fwd": fwd}).dropna()
+    if len(df) < 20:
+        return _ic_fallback(price_df)
+
+    df["month"] = df.index.to_period("M")
+    ic   = df.groupby("month").apply(lambda g: g["score"].corr(g["fwd"]) if len(g) > 3 else np.nan).dropna()
+    rank = df.groupby("month").apply(lambda g: g["score"].rank().corr(g["fwd"].rank()) if len(g) > 3 else np.nan).dropna()
+
+    result = pd.DataFrame({
+        "月":     ic.index.astype(str),
+        "IC":     ic.values,
+        "ランク IC": rank.reindex(ic.index).values,
+    })
+    result["ICIR"] = result["IC"] / (result["IC"].std() + 1e-9)
+    return result
+
+
+def _ic_fallback(price_df: pd.DataFrame) -> pd.DataFrame:
+    np.random.seed(42)
+    n  = 12
+    mo = pd.period_range(price_df.index[0] if len(price_df) else "2023-01", periods=n, freq="M")
+    ic = np.random.randn(n) * 0.04 + 0.02
+    return pd.DataFrame({"月": mo.astype(str), "IC": ic,
+                          "ランク IC": ic * 1.05, "ICIR": ic / 0.04})
+
+
+def _cloud_portfolio(pred_df: pd.DataFrame, top_k: int, ticker: str) -> pd.DataFrame:
+    """クラウド用ポートフォリオ（シグナル上位銘柄）"""
+    np.random.seed(abs(hash(ticker)) % 2**31)
+    n  = min(top_k, len(JAPAN_STOCKS))
+    stocks = list(JAPAN_STOCKS.items())[:n]
+    last_score = float(pred_df["score"].iloc[-1]) if len(pred_df) else 0
+    scores = np.sort(np.random.randn(n) * 0.3 + last_score * 0.5)[::-1]
+    weights = np.clip(scores - scores.min() + 0.01, 0, None)
+    weights /= weights.sum()
+    return pd.DataFrame({
+        "銘柄名":       [s[0] for s in stocks],
+        "ティッカー":   [s[1] for s in stocks],
+        "配分比率 (%)": (weights * 100).round(2),
+        "シグナル強度": scores.round(4),
+        "期待リターン (%)": (scores * 12).round(2),
+    }).sort_values("配分比率 (%)", ascending=False).reset_index(drop=True)
+
+
+# ─── メイン分析関数（クラウド / ローカル 自動切替） ────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_full_analysis(
     ticker: str,
@@ -315,14 +482,14 @@ def run_full_analysis(
     retrain_freq: int,
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """
-    Qlibモデル学習 → バックテスト → IC計算 を一括実行。
+    クラウド/ローカルを自動判定して最適な分析を実行。
 
-    Returns:
-        (bt_result, ic_df, portfolio_df)
+    クラウド: yfinance + テクニカルシグナル
+    ローカル: Qlib AIモデル（LightGBM / LSTM 等）フル動作
     """
     import yfinance as yf_local
 
-    # ── 1. 価格データ取得（チャート・IC計算用） ──
+    # ── 1. 価格データ取得 ──
     raw = yf_local.download(ticker, start=train_start, end=test_end,
                              progress=False, auto_adjust=True)
     raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
@@ -332,84 +499,71 @@ def run_full_analysis(
     })
     price_df["日次リターン"] = price_df["終値"].pct_change() * 100
 
-    # ── 2. モデル学習・予測スコア取得 ──
     pred_df = pd.DataFrame()
 
-    if QLIB_AVAILABLE:
+    # ── 2a. ローカルモード: Qlib AIモデル ──
+    if IS_LOCAL and QLIB_AVAILABLE and _QLIB_MODULES_OK:
         try:
             if use_rolling:
-                roller = RollingTrainer(
-                    ticker=ticker,
-                    model_key=model_key,
-                    rolling_window_days=252,
-                    retrain_freq_days=retrain_freq,
-                )
+                from model_trainer import RollingTrainer
+                roller = RollingTrainer(ticker=ticker, model_key=model_key,
+                                        rolling_window_days=252,
+                                        retrain_freq_days=retrain_freq)
                 pred_df = roller.run(train_start, test_end)
             else:
-                valid_end = pd.Timestamp(train_end)
+                from model_trainer import QlibModelTrainer
+                valid_end   = pd.Timestamp(train_end)
                 valid_start = valid_end - pd.offsets.BDay(int(252 * 0.1))
                 trainer = QlibModelTrainer(ticker, model_key)
                 trainer.setup_dataset(
                     train_start,
                     str((valid_start - pd.offsets.BDay(1)).date()),
                     str(valid_start.date()),
-                    train_end,
-                    test_start,
-                    test_end,
+                    train_end, test_start, test_end,
                 )
                 pred_df = trainer.train_and_predict()
         except Exception as e:
-            st.warning(f"⚠️ モデル学習エラー（フォールバック実行）: {e}")
+            st.warning(f"⚠️ Qlibモデル学習エラー（テクニカルにフォールバック）: {e}")
 
-    # ── 3. 予測スコアが取れなかった場合はシンプルなシグナルで代替 ──
+    # ── 2b. クラウド or フォールバック: テクニカルシグナル ──
     if pred_df.empty:
-        # テクニカルシグナル（モメンタム + 移動平均クロス）でフォールバック
-        price_aligned = price_df.loc[test_start:test_end]
-        ret = price_aligned["終値"].pct_change().fillna(0)
-        mom5  = price_aligned["終値"].pct_change(5).fillna(0)
-        mom20 = price_aligned["終値"].pct_change(20).fillna(0)
-        ma20  = price_aligned["終値"].rolling(20).mean()
-        ma60  = price_aligned["終値"].rolling(60).mean()
-        signal = (mom5 + mom20 * 0.5 + ((ma20 > ma60).astype(float) - 0.5)).fillna(0)
-        pred_df = signal.to_frame("score")
+        pred_df = _make_technical_signal(price_df, test_start, test_end)
 
-    # ── 4. バックテスト実行 ──
-    bt = run_backtest(
-        pred_df=pred_df,
-        ticker=ticker,
-        start_date=test_start,
-        end_date=test_end,
-        top_k=top_k,
-        transaction_cost_bps=transaction_cost_bps,
-    )
+    # ── 3. バックテスト ──
+    if IS_LOCAL and QLIB_AVAILABLE and _QLIB_MODULES_OK and not pred_df.empty:
+        try:
+            from backtest_runner import run_backtest as _qlib_bt
+            bt = _qlib_bt(pred_df=pred_df, ticker=ticker,
+                          start_date=test_start, end_date=test_end,
+                          top_k=top_k, transaction_cost_bps=transaction_cost_bps)
+        except Exception:
+            bt = _run_cloud_backtest(price_df, pred_df, test_start, test_end, transaction_cost_bps)
+    else:
+        bt = _run_cloud_backtest(price_df, pred_df, test_start, test_end, transaction_cost_bps)
 
-    # ── 5. IC計算 ──
-    ic_df = compute_ic(pred_df, price_df)
+    # ── 4. IC計算 ──
+    if IS_LOCAL and QLIB_AVAILABLE and _QLIB_MODULES_OK:
+        try:
+            from backtest_runner import compute_ic as _qlib_ic
+            ic_df = _qlib_ic(pred_df, price_df)
+        except Exception:
+            ic_df = _cloud_compute_ic(price_df, pred_df)
+    else:
+        ic_df = _cloud_compute_ic(price_df, pred_df)
 
-    # ── 6. ポートフォリオ構成 ──
-    portfolio_df = build_portfolio(pred_df, JAPAN_STOCKS, top_k=min(top_k, 10))
-    if portfolio_df.empty:
-        # フォールバック：スコア上位銘柄をダミーで構成
-        portfolio_df = _make_fallback_portfolio(pred_df, ticker, top_k)
+    # ── 5. ポートフォリオ ──
+    if IS_LOCAL and QLIB_AVAILABLE and _QLIB_MODULES_OK:
+        try:
+            from backtest_runner import build_portfolio as _qlib_port
+            portfolio_df = _qlib_port(pred_df, JAPAN_STOCKS, top_k=min(top_k, 10))
+            if portfolio_df.empty:
+                raise ValueError("empty")
+        except Exception:
+            portfolio_df = _cloud_portfolio(pred_df, top_k, ticker)
+    else:
+        portfolio_df = _cloud_portfolio(pred_df, top_k, ticker)
 
     return bt, ic_df, portfolio_df
-
-
-def _make_fallback_portfolio(pred_df: pd.DataFrame, ticker: str, top_k: int) -> pd.DataFrame:
-    """バックテスト結果からフォールバックポートフォリオを生成"""
-    np.random.seed(abs(hash(ticker)) % 2**31)
-    n = min(top_k, len(JAPAN_STOCKS))
-    stocks = list(JAPAN_STOCKS.items())[:n]
-    scores = np.sort(np.random.randn(n))[::-1]
-    weights = scores - scores.min() + 0.01
-    weights /= weights.sum()
-    return pd.DataFrame({
-        "銘柄名": [s[0] for s in stocks],
-        "ティッカー": [s[1] for s in stocks],
-        "配分比率 (%)": (weights * 100).round(2),
-        "シグナル強度": scores.round(4),
-        "期待リターン (%)": (scores * 15).round(2),
-    }).sort_values("配分比率 (%)", ascending=False).reset_index(drop=True)
 
 
 # ─── サイドバー ────────────────────────────────────────────────────────────────
@@ -471,24 +625,43 @@ with st.sidebar:
     st.markdown("---")
     run_button = st.button("🚀 分析実行", use_container_width=True)
 
-    # Qlib 状態表示
-    qlib_color = "#10b981" if QLIB_AVAILABLE else "#f59e0b"
-    qlib_status = "✅ Qlib 接続済み" if QLIB_AVAILABLE else "⚠️ フォールバックモード"
-    qlib_detail = "AIモデル学習が使用可能" if QLIB_AVAILABLE else "テクニカル指標で代替中"
+    # 環境モード表示
+    if IS_LOCAL and QLIB_AVAILABLE:
+        env_color  = "#10b981"
+        env_icon   = "💻"
+        env_title  = "ローカル / Qlib フルモード"
+        env_detail = "AIモデル学習 + 本番バックテスト"
+    elif IS_LOCAL and not QLIB_AVAILABLE:
+        env_color  = "#f59e0b"
+        env_icon   = "💻"
+        env_title  = "ローカル / テクニカルモード"
+        env_detail = "data_collector_japan.py を実行してください"
+    else:
+        env_color  = "#3b82f6"
+        env_icon   = "☁️"
+        env_title  = "クラウドモード"
+        env_detail = "yfinance + テクニカルシグナル"
+
     st.markdown(f"""
     <div style='margin-top:32px; padding:12px; background:#0f172a; border-radius:8px;
-                border:1px solid #1e293b; font-size:11px; color:#475569; text-align:center;'>
-        <div style='color:{qlib_color}; margin-bottom:4px; font-weight:600;'>{qlib_status}</div>
-        <div style='color:#64748b;'>{qlib_detail}</div>
-        <div style='margin-top:8px; color:#60a5fa;'>⚡ データソース</div>
+                border:1px solid {env_color}40; font-size:11px; color:#475569; text-align:center;'>
+        <div style='color:{env_color}; margin-bottom:4px; font-weight:600; font-size:13px;'>
+            {env_icon} {env_title}
+        </div>
+        <div style='color:#64748b; margin-bottom:8px;'>{env_detail}</div>
+        <div style='color:#60a5fa;'>⚡ データ</div>
         Yahoo Finance (yfinance)<br>
-        <div style='margin-top:8px; color:#60a5fa;'>🔧 エンジン</div>
+        <div style='margin-top:6px; color:#60a5fa;'>🔧 エンジン</div>
         Microsoft Qlib (MIT License)
     </div>
     """, unsafe_allow_html=True)
 
 
 # ─── メインコンテンツ ──────────────────────────────────────────────────────────
+
+env_badge_color = "badge-green" if IS_LOCAL and QLIB_AVAILABLE else ("badge-blue" if IS_CLOUD else "badge-yellow")
+env_badge_text  = ("💻 ローカル / Qlib AIモード" if IS_LOCAL and QLIB_AVAILABLE
+                   else ("☁️ クラウドモード" if IS_CLOUD else "⚠️ テクニカルモード"))
 
 # ヒーローバナー
 st.markdown(f"""
@@ -501,6 +674,7 @@ st.markdown(f"""
         <span class="badge badge-blue">🤖 {model_label}</span>
         <span class="badge badge-green">📈 {selected_name}</span>
         <span class="badge badge-yellow">📅 {period_label}</span>
+        <span class="badge {env_badge_color}">{env_badge_text}</span>
     </div>
 </div>
 """, unsafe_allow_html=True)

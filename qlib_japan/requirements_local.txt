@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────
+# requirements_local.txt  ←  ローカルPC用（フル機能）
+# ─────────────────────────────────────────────
+# pip install -r requirements_local.txt
+# で Qlib AIモデルがフル動作します。
+# ─────────────────────────────────────────────
+
+# ── UI・データ取得（クラウドと共通）
+streamlit>=1.32.0
+yfinance>=0.2.38
+pandas>=2.0.0
+numpy>=1.26.0
+plotly>=5.20.0
+
+# ── Qlib 本体
+pyqlib>=0.9.0
+
+# ── 機械学習モデル
+lightgbm>=4.0.0
+xgboost>=2.0.0
+
+# ── 深層学習モデル（LSTM / GRU / Transformer）
+# ※ GPU環境なら torch+cu118 等に変更してください
+torch>=2.0.0
+
+# ── ユーティリティ
+scikit-learn>=1.4.0
+ruamel.yaml>=0.17.0

@@ -1,0 +1,15 @@
+[general]
+# Streamlit Cloud にデプロイする際のメインファイル指定
+# GitHub連携時に「Main file path」へ qlib_japan/app.py を設定してください
+
+[server]
+headless = true
+enableCORS = false
+
+[theme]
+# ダークテーマ固定
+base = "dark"
+backgroundColor = "#0a0e1a"
+secondaryBackgroundColor = "#111827"
+textColor = "#f1f5f9"
+primaryColor = "#3b82f6"
