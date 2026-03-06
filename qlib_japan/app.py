@@ -298,24 +298,67 @@ html, body, [class*="css"] {
 
 # ─── データ取得関数 ────────────────────────────────────────────────────────────
 
-# 主要東証銘柄（サンプル）
-JAPAN_STOCKS = {
-    "トヨタ自動車": "7203.T",
-    "ソニーグループ": "6758.T",
-    "ソフトバンクグループ": "9984.T",
-    "キーエンス": "6861.T",
-    "三菱UFJフィナンシャル": "8306.T",
-    "任天堂": "7974.T",
-    "ファーストリテイリング": "9983.T",
-    "信越化学工業": "4063.T",
-    "東京エレクトロン": "8035.T",
-    "リクルートHD": "6098.T",
-    "HOYA": "7741.T",
-    "ダイキン工業": "6367.T",
-    "日本電産（ニデック）": "6594.T",
-    "エムスリー": "2413.T",
-    "オリエンタルランド": "4661.T",
-}
+# ─── 自分のポートフォリオ（デフォルト表示銘柄）────────────────────────────────
+# 保有銘柄の証券コードをここに入力してください（.T なし）
+MY_PORTFOLIO: list[str] = [
+    "7003",   # 三井E&S
+    "7011",   # 三菱重工業
+    "8306",   # 三菱UFJフィナンシャル
+    "7936",   # アシックス
+    "5333",   # NGK
+    # ↓ ここに自分の保有銘柄コードを追加してください
+]
+
+# 社名キャッシュ（起動中はyfinance再取得しないようにメモリに保持）
+_NAME_CACHE: dict[str, str] = {}
+
+@st.cache_data(ttl=86400, show_spinner=False)  # 24時間キャッシュ
+def resolve_stock_name(code: str) -> str:
+    """
+    証券コードから社名をyfinanceで自動取得する。
+    - キャッシュ済み → 即返す
+    - 未取得 → yfinanceで取得してキャッシュ
+    - 取得失敗 → コードをそのまま返す
+    """
+    clean = code.upper().replace(".T", "").strip()
+
+    if clean in _NAME_CACHE:
+        return _NAME_CACHE[clean]
+
+    try:
+        info = yf.Ticker(f"{clean}.T").info
+        name = (info.get("longName")
+                or info.get("shortName")
+                or info.get("displayName")
+                or clean)
+        # yfinanceが返す社名は英語の場合もあるのでそのまま使う
+        _NAME_CACHE[clean] = name
+        return name
+    except Exception:
+        _NAME_CACHE[clean] = clean
+        return clean
+
+
+# JAPAN_STOCKS（プルダウン用）
+# MY_PORTFOLIOのコードから社名を自動解決して生成
+@st.cache_data(ttl=86400, show_spinner=False)
+def build_japan_stocks() -> dict[str, str]:
+    """プルダウン用の {社名: ティッカー} 辞書をyfinanceから自動生成"""
+    # ベース銘柄（主要東証銘柄）
+    base_codes = [
+        "7003", "7011", "8306", "7936", "5355",
+        "4183", "1719", "6882", "5355", "4765",
+        "8729", "8113", "2502", "6293", "9023",
+    ]
+    # MY_PORTFOLIOをマージ（重複除去）
+    all_codes = list(dict.fromkeys(MY_PORTFOLIO + base_codes))
+    result = {}
+    for code in all_codes:
+        name = resolve_stock_name(code)
+        result[name] = f"{code}.T"
+    return result
+
+JAPAN_STOCKS = build_japan_stocks()
 
 MODELS = {
     "LightGBM（高速・安定）": "lightgbm",
@@ -589,16 +632,12 @@ with st.sidebar:
     ticker_input = custom_ticker.strip().upper()
 
     if ticker_input:
-        # カスタムティッカーが入力されている場合
-        # 末尾に .T がなければ自動補完
         if "." not in ticker_input:
             ticker_input = ticker_input + ".T"
         ticker = ticker_input
-        # 逆引き：JAPAN_STOCKSに一致する銘柄名があれば使う、なければティッカーをそのまま表示
-        ticker_to_name = {v.upper(): k for k, v in JAPAN_STOCKS.items()}
-        display_name = ticker_to_name.get(ticker.upper(), ticker)
+        # 社名解決（辞書 → yfinance自動取得）
+        display_name = resolve_stock_name(ticker_input)
     else:
-        # プルダウン選択を使う
         ticker = JAPAN_STOCKS[selected_name]
         display_name = selected_name
 
@@ -1009,6 +1048,67 @@ with tab4:
 
     source_label = "Qlibシグナル" if QLIB_AVAILABLE and bt.get("source") == "qlib" else "テクニカルシグナル"
 
+    # ── マイPF編集UI ──
+    with st.expander("✏️ マイポートフォリオを編集", expanded=False):
+        st.caption("証券コードをカンマ区切りで入力（例: 7203, 6758, 9984）")
+        pf_input = st.text_input(
+            "保有銘柄コード",
+            value=", ".join(MY_PORTFOLIO),
+            label_visibility="collapsed",
+        )
+        if pf_input:
+            new_codes = [c.strip() for c in pf_input.split(",") if c.strip()]
+            # 入力コードの社名をリアルタイム解決して表示
+            resolved = [(c, resolve_stock_name(c)) for c in new_codes]
+            st.markdown("**認識結果:**")
+            cols_pf = st.columns(min(len(resolved), 5))
+            for i, (code, name) in enumerate(resolved):
+                cols_pf[i % 5].markdown(
+                    f'<div style="background:#161d2e; border-radius:6px; padding:6px 10px;'
+                    f'font-size:12px; text-align:center; margin:2px;">'
+                    f'<b style="color:#60a5fa;">{code}</b><br>'
+                    f'<span style="color:#94a3b8;">{name}</span></div>',
+                    unsafe_allow_html=True,
+                )
+            # セッション内で更新
+            current_pf_codes = new_codes
+        else:
+            current_pf_codes = MY_PORTFOLIO
+
+    # ── マイPFの実績チャート ──
+    st.markdown("#### 📊 保有銘柄パフォーマンス比較")
+    pf_tickers = [f"{c}.T" for c in current_pf_codes]
+    pf_names   = [resolve_stock_name(c) for c in current_pf_codes]
+
+    fig_pf = go.Figure()
+    for t, n in zip(pf_tickers, pf_names):
+        try:
+            pf_raw = yf.download(t, period=period, progress=False, auto_adjust=True)
+            if not pf_raw.empty:
+                pf_raw.columns = [c[0] if isinstance(c, tuple) else c for c in pf_raw.columns]
+                close = pf_raw["Close"]
+                norm  = (close / close.iloc[0] - 1) * 100   # 累積リターン(%)
+                fig_pf.add_trace(go.Scatter(
+                    x=norm.index, y=norm.values,
+                    name=n, mode="lines", line=dict(width=1.5),
+                ))
+        except Exception:
+            pass
+
+    fig_pf.update_layout(
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#111827",
+        font=dict(color="#94a3b8", family="Noto Sans JP"),
+        height=320, margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+        yaxis_title="累積リターン (%)",
+    )
+    fig_pf.update_xaxes(gridcolor="#1e293b")
+    fig_pf.update_yaxes(gridcolor="#1e293b", zeroline=True,
+                         zerolinecolor="#334155", zerolinewidth=1)
+    st.plotly_chart(fig_pf, use_container_width=True)
+
+    # ── AIシグナルポートフォリオ ──
+    st.markdown("#### 🤖 AIシグナル ポートフォリオ配分")
     col_left, col_right = st.columns([1.2, 1])
     with col_left:
         st.dataframe(portfolio_df, use_container_width=True, height=320)
