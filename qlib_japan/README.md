@@ -2,6 +2,7 @@
 
 Microsoft Qlib × yfinance で構築した、東証銘柄対応のAIクオンツ投資プラットフォームです。
 
+
 ---
 
 ## 📦 ファイル構成
@@ -87,3 +88,7 @@ streamlit run app.py
 - [Microsoft Qlib](https://github.com/microsoft/qlib)
 - [J-Quants API](https://jpx-jquants.com/)
 - [Qlib ドキュメント](https://qlib.readthedocs.io/)
+
+- ## ライセンス
+MIT License — 詳細は [LICENSE](./LICENSE) を参照。
+本プロジェクトは [Microsoft Qlib](https://github.com/microsoft/qlib)（MIT License）を使用しています。
