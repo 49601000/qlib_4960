@@ -586,7 +586,21 @@ with st.sidebar:
         "カスタムティッカー（例: 6501.T）",
         placeholder="空白なら上記銘柄を使用",
     )
-    ticker = custom_ticker.strip() if custom_ticker.strip() else JAPAN_STOCKS[selected_name]
+    ticker_input = custom_ticker.strip().upper()
+
+    if ticker_input:
+        # カスタムティッカーが入力されている場合
+        # 末尾に .T がなければ自動補完
+        if "." not in ticker_input:
+            ticker_input = ticker_input + ".T"
+        ticker = ticker_input
+        # 逆引き：JAPAN_STOCKSに一致する銘柄名があれば使う、なければティッカーをそのまま表示
+        ticker_to_name = {v.upper(): k for k, v in JAPAN_STOCKS.items()}
+        display_name = ticker_to_name.get(ticker.upper(), ticker)
+    else:
+        # プルダウン選択を使う
+        ticker = JAPAN_STOCKS[selected_name]
+        display_name = selected_name
 
     st.markdown("---")
     st.markdown("### 📅 分析期間")
@@ -672,7 +686,7 @@ st.markdown(f"""
     </p>
     <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
         <span class="badge badge-blue">🤖 {model_label}</span>
-        <span class="badge badge-green">📈 {selected_name}</span>
+        <span class="badge badge-green">📈 {display_name}</span>
         <span class="badge badge-yellow">📅 {period_label}</span>
         <span class="badge {env_badge_color}">{env_badge_text}</span>
     </div>
@@ -730,7 +744,7 @@ st.markdown(f"""
         <span>LIVE DATA</span>
     </div>
     <span>｜</span>
-    <span><b style="color:#f1f5f9;">{ticker}</b> — {selected_name}</span>
+    <span><b style="color:#f1f5f9;">{ticker}</b> — {display_name}</span>
     <span>｜</span>
     <span>終値: <b style="color:#f1f5f9;">¥{last_price:,.0f}</b>
           <b style="color:{price_color};">{arrow}{abs(price_change):.2f}%</b></span>
