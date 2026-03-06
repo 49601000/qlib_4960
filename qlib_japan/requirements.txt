@@ -1,0 +1,17 @@
+streamlit>=1.32.0
+yfinance>=0.2.38
+pandas>=2.0.0
+numpy>=1.26.0
+plotly>=5.20.0
+
+# ── Qlib本体（AIモデル学習に必要）
+pyqlib>=0.9.0
+
+# ── 機械学習モデル
+lightgbm>=4.0.0
+xgboost>=2.0.0
+torch>=2.0.0          # LSTM / GRU / Transformer 使用時
+scikit-learn>=1.4.0
+
+# ── ユーティリティ
+ruamel.yaml>=0.17.0   # Qlib設定ファイル用
