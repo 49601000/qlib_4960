@@ -111,47 +111,62 @@ def build_dataset_config(
     valid_end: str,
     test_start: str,
     test_end: str,
-    handler_type: str = "alpha158",
+    handler_type: str = "alpha158",  # 引数は互換性のため残すが内部では使わない
 ) -> dict:
     """
     Qlibデータセット設定を生成する。
-    handler_type: "alpha158" or "alpha360"
+    Alpha158はlookback期間のズレが発生しやすいため、
+    シンプルなカスタム特徴量ハンドラーを使用する。
     """
     stock_id = ticker.replace(".T", "").upper()
 
-    if handler_type == "alpha158":
-        handler_cfg = {
-            "class": "Alpha158",
-            "module_path": "qlib.contrib.data.handler",
-            "kwargs": {
-                "start_time": train_start,
-                "end_time": test_end,
-                "fit_start_time": train_start,
-                "fit_end_time": train_end,
-                "instruments": [stock_id],
-                "infer_processors": [
-                    {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-                    {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-                ],
-                "learn_processors": [
-                    {"class": "DropnaLabel"},
-                    {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
-                ],
-                "label": ["Ref($close, -2) / Ref($close, -1) - 1"],
+    # バッファ: Alpha158のlookback最大値(60日)+ 余裕10日
+    buf_start = (pd.Timestamp(train_start) - pd.offsets.BDay(70)).strftime("%Y-%m-%d")
+    buf_end   = (pd.Timestamp(test_end)    + pd.offsets.BDay(5)).strftime("%Y-%m-%d")
+
+    # シンプルな特徴量定義（lookbackが短くズレが起きにくい）
+    fields = [
+        "$close / Ref($close, 1) - 1",      # 1日リターン
+        "$close / Ref($close, 5) - 1",      # 5日リターン
+        "$close / Ref($close, 20) - 1",     # 20日リターン
+        "($close - Mean($close, 20)) / Std($close, 20) + 1e-9",  # 20日Zスコア
+        "$volume / Mean($volume, 20)",       # 出来高比率
+        "($high - $low) / $close",           # 日中値幅
+        "($close - $low) / ($high - $low + 1e-9)",  # 終値位置
+        "Mean($close, 5) / Mean($close, 20) - 1",   # MAクロス
+    ]
+    col_names = [f"feature_{i}" for i in range(len(fields))]
+
+    handler_cfg = {
+        "class": "DataHandlerLP",
+        "module_path": "qlib.data.dataset.handler",
+        "kwargs": {
+            "start_time": buf_start,
+            "end_time":   buf_end,
+            "instruments": [stock_id],
+            "infer_processors": [],   # ← 正規化なし（LightGBMは正規化不要）
+            "learn_processors": [
+                {
+                    "class": "DropnaLabel",
+                    "module_path": "qlib.data.dataset.processor",
+                },
+            ],
+            "data_loader": {
+                "class": "QlibDataLoader",
+                "module_path": "qlib.data.dataset.loader",
+                "kwargs": {
+                    "config": {
+                        "feature": (fields, col_names),
+                        "label": (
+                            ["Ref($close, -1) / $close - 1"],
+                            ["LABEL0"],
+                        ),
+                    },
+                    "freq": "day",
+                },
             },
-        }
-    else:  # alpha360
-        handler_cfg = {
-            "class": "Alpha360",
-            "module_path": "qlib.contrib.data.handler",
-            "kwargs": {
-                "start_time": train_start,
-                "end_time": test_end,
-                "fit_start_time": train_start,
-                "fit_end_time": train_end,
-                "instruments": [stock_id],
-            },
-        }
+        },
+    }
 
     return {
         "class": "DatasetH",
@@ -161,7 +176,7 @@ def build_dataset_config(
             "segments": {
                 "train": (train_start, train_end),
                 "valid": (valid_start, valid_end),
-                "test": (test_start, test_end),
+                "test":  (test_start,  test_end),
             },
         },
     }

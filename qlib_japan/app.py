@@ -515,10 +515,10 @@ def run_full_analysis(
             else:
                 from model_trainer import QlibModelTrainer
                 trainer = QlibModelTrainer(ticker, model_key)
-                # valid_start/valid_end を外から受け取って使う（営業日ズレ解消）
+                # 引数順: train_start, train_end, valid_start, valid_end, test_start, test_end
                 trainer.setup_dataset(
-                    train_start, valid_start,
-                    valid_end,   train_end,
+                    train_start, train_end,
+                    valid_start, valid_end,
                     test_start,  test_end,
                 )
                 pred_df = trainer.train_and_predict()
