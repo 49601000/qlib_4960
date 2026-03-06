@@ -473,6 +473,8 @@ def run_full_analysis(
     ticker: str,
     model_key: str,
     train_start: str,
+    valid_start: str,
+    valid_end: str,
     train_end: str,
     test_start: str,
     test_end: str,
@@ -512,14 +514,12 @@ def run_full_analysis(
                 pred_df = roller.run(train_start, test_end)
             else:
                 from model_trainer import QlibModelTrainer
-                valid_end   = pd.Timestamp(train_end)
-                valid_start = valid_end - pd.offsets.BDay(int(252 * 0.1))
                 trainer = QlibModelTrainer(ticker, model_key)
+                # valid_start/valid_end を外から受け取って使う（営業日ズレ解消）
                 trainer.setup_dataset(
-                    train_start,
-                    str((valid_start - pd.offsets.BDay(1)).date()),
-                    str(valid_start.date()),
-                    train_end, test_start, test_end,
+                    train_start, valid_start,
+                    valid_end,   train_end,
+                    test_start,  test_end,
                 )
                 pred_df = trainer.train_and_predict()
         except Exception as e:
@@ -702,17 +702,37 @@ if df.empty:
     st.stop()
 
 # ─── 分析実行（学習期間・テスト期間の計算） ───────────────────────────────────
-period_days = {"3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "5y": 1825}
-total_days = period_days.get(period, 365)
-end_dt   = datetime.today()
-start_dt = end_dt - timedelta(days=total_days)
+# timedelta ではなく営業日ベースで分割することで
+# Qlib内部の配列サイズズレ (253,) vs (252,) を防ぐ
 
-# 学習:テスト = 7:3 分割
-split_dt = start_dt + timedelta(days=int(total_days * 0.7))
-train_start = start_dt.strftime("%Y-%m-%d")
-train_end   = split_dt.strftime("%Y-%m-%d")
-test_start  = (split_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-test_end    = end_dt.strftime("%Y-%m-%d")
+period_bdays = {"3mo": 63, "6mo": 126, "1y": 252, "2y": 504, "5y": 1260}
+total_bdays  = period_bdays.get(period, 252)
+
+# 実際のyfinanceデータのインデックス（営業日のみ）を使って分割
+if not df.empty:
+    biz_dates   = df.index                          # yfinanceが返す営業日インデックス
+    n_total     = len(biz_dates)
+    n_train     = max(int(n_total * 0.7), 60)       # 最低60営業日は学習に使う
+    n_valid     = max(int(n_train * 0.1), 20)       # 学習の10%をバリデーションに
+
+    train_start = biz_dates[0].strftime("%Y-%m-%d")
+    valid_start = biz_dates[n_train - n_valid].strftime("%Y-%m-%d")
+    valid_end   = biz_dates[n_train - 1].strftime("%Y-%m-%d")
+    train_end   = valid_end                         # Qlibのtrain_endはvalid_endと同じでOK
+    test_start  = biz_dates[n_train].strftime("%Y-%m-%d")
+    test_end    = biz_dates[-1].strftime("%Y-%m-%d")
+else:
+    # dfが空の場合のフォールバック（通常ここには来ない）
+    end_dt      = datetime.today()
+    start_dt    = end_dt - timedelta(days=365)
+    split_dt    = start_dt + timedelta(days=255)
+    train_start = start_dt.strftime("%Y-%m-%d")
+    valid_start = (start_dt + timedelta(days=204)).strftime("%Y-%m-%d")
+    valid_end   = (start_dt + timedelta(days=254)).strftime("%Y-%m-%d")
+    train_end   = valid_end
+    test_start  = (split_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    test_end    = end_dt.strftime("%Y-%m-%d")
+
 retrain_freq_val = retrain_freq if retrain else 60
 
 # 分析実行（キャッシュ付き）
@@ -721,6 +741,8 @@ with st.spinner("🤖 モデル学習・バックテスト実行中..."):
         ticker=ticker,
         model_key=model_key,
         train_start=train_start,
+        valid_start=valid_start,
+        valid_end=valid_end,
         train_end=train_end,
         test_start=test_start,
         test_end=test_end,
